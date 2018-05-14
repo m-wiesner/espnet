@@ -180,27 +180,25 @@ fi
 
 
 if $use_lm; then
-  lm_train_set=data/local/train.txt
-  lm_valid_set=data/local/dev.txt
- 
+  mkdir -p data/local 
   # Make train and valid
   text2token.py --nchar 1 \
                 --space "<space>" \
                 --non-lang-syms data/lang_1char/non_lang_syms.txt \
-                <(cut -d' ' -f2- data/${train_set}/text | head -100) |\
+                <(cut -d' ' -f2- data/${train_set}/text) |\
                 sed 's/^ //;s/$/ <eos>/' | paste -d' ' -s > ${lm_train_set} 
 
   text2token.py --nchar 1 \
                 --space "<space>" \
                 --non-lang-syms data/lang_1char/non_lang_syms.txt \
-                <(cut -d' ' -f2- data/${train_dev}/text | head -100) |\
+                <(cut -d' ' -f2- data/${train_dev}/text) |\
                 sed 's/^ //;s/$/ <eos>/' | paste -d' ' -s > ${lm_valid_set} 
 
   if [ ${ngpu} -gt 1 ]; then
         echo "LM training does not support multi-gpu. signle gpu will be used."
         lmngpu=1
   else
-        lmngpu=0
+        lmngpu=${ngpu}
   fi
 
   
@@ -208,6 +206,8 @@ if $use_lm; then
           lm_train.py \
           --ngpu ${lmngpu} \
           --backend ${backend} \
+          --batchsize 400 \
+          --epoch 30 \
           --verbose 1 \
           --outdir ${lmexpdir} \
           --train-label ${lm_train_set} \
