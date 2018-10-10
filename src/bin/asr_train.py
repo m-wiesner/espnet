@@ -72,6 +72,8 @@ def main():
     parser.add_argument('--kaldi-mdl', default='', type=str, action='store', 
                         required=False, help='Kaldi nnet3 model file. Output of'
                         ' nnet3-copy --binary=False final.mdl text_mdl.txt')
+    parser.add_argument('--freeze', action='store_true', help='Freeze imported'
+                        ' kaldi network')
     # loss
     parser.add_argument('--ctc_type', default='warpctc', type=str,
                         choices=['chainer', 'warpctc'],

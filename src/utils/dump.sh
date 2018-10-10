@@ -33,7 +33,7 @@ dumpdir=`perl -e '($dir,$pwd)= @ARGV; if($dir!~m:^/:) { $dir = "$pwd/$dir"; } pr
 for n in $(seq $nj); do
     # the next command does nothing unless $dumpdir/storage/ exists, see
     # utils/create_data_link.pl for more info.
-    utils/create_data_link.pl ${dumpdir}/feats.${n}.ark
+    #utils/create_data_link.pl ${dumpdir}/feats.${n}.ark
     if [ ! -z $ivectors ] && [ -f $ivectors ]; then
         ./utils/create_data_link.pl ${dumpdir}/ivectors_online.${i}.ark
     fi
@@ -53,7 +53,7 @@ for n in $(seq $nj); do
     split_scps_ivector="$split_scps_ivector $logdir/ivectors_online.$n.scp"
 done
 
-utils/split_scp.pl $scp $split_scps || exit 1;
+#utils/split_scp.pl $scp $split_scps || exit 1;
 if [ ! -z $ivectors ] && [ -f $ivectors ]; then
     utils/split_scp.pl $ivectors $split_scps_ivector || exit 1;
 fi
@@ -76,8 +76,8 @@ fi
 feat_cmd="${feat_cmd} copy-feats --compress=${compress} --compression-method=2 ${write_num_frames_opt} ark:- ark,scp:${dumpdir}/feats.JOB.ark,${dumpdir}/feats.JOB.scp"
 
 # Extract features
-$cmd JOB=1:${nj} ${logdir}/dump_feature.JOB.log \
-  ${feat_cmd} || exit 1
+#$cmd JOB=1:${nj} ${logdir}/dump_feature.JOB.log \
+#  ${feat_cmd} || exit 1
 
 if [ ! -z $ivectors ] && [ -f $ivectors ]; then
     $cmd JOB=1:$nj $logdir/dump_ivectors.JOB.log \
@@ -89,14 +89,14 @@ if [ ! -z $ivectors ] && [ -f $ivectors ]; then
 fi
 
 # concatenate scp files
-cat ${dumpdir}/feats.*.scp > ${dumpdir}/feats.scp
+#cat ${dumpdir}/feats.*.scp > ${dumpdir}/feats.scp
 
-if $write_utt2num_frames; then
-    for n in $(seq $nj); do
-        cat $dumpdir/utt2num_frames.$n || exit 1;
-    done > $dumpdir/utt2num_frames || exit 1
-    rm $dumpdir/utt2num_frames.* 2>/dev/null
-fi
+#if $write_utt2num_frames; then
+#    for n in $(seq $nj); do
+#        cat $dumpdir/utt2num_frames.$n || exit 1;
+#    done > $dumpdir/utt2num_frames || exit 1
+#    rm $dumpdir/utt2num_frames.* 2>/dev/null
+#fi
 
 # remove temp scps
 rm $logdir/feats.*.scp 2>/dev/null

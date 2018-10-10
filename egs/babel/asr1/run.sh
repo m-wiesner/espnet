@@ -32,7 +32,9 @@ tdnn_offsets="0 -1,0,1 -1,0,1 -3,0,3 -3,0,3 -3,0,3 -3,0,3"
 tdnn_odims="625 625 625 625 625 625 625"
 tdnn_prefinal_affine_dim=625
 tdnn_final_affine_dim=3000
-kaldi_mdl='text_8k.mdl'
+kaldi_mdl=
+freeze=false
+#kaldi_mdl="text_8k.mdl"
 
 # decoder related
 dlayers=1
@@ -64,12 +66,13 @@ epochs=15
 
 # rnnlm related
 use_lm=false
-lm_layers=2
+use_wordlm=false
+lm_layers=1
 lm_units=650
 lm_opt=sgd        # or adam
 lm_batchsize=256  # batch size in LM training
 lm_epochs=20      # if the data size is large, we can reduce this
-lm_maxlen=100     # if sentence length > lm_maxlen, lm_batchsize is automatically reduced
+lm_maxlen=40     # if sentence length > lm_maxlen, lm_batchsize is automatically reduced
 lm_resume=        # specify a snapshot file to resume LM training
 lmtag=            # tag for managing LMs
 
@@ -112,13 +115,12 @@ if [ ${#tdnn_odims_array[@]} -ne ${#tdnn_offsets_array[@]} ]; then
 fi
 
 
-# LM Directories
-if [ -z ${lmtag} ]; then
-    lmtag=${lm_layers}layer_unit${lm_units}_${lm_opt}_bs${lm_batchsize}
+ivector_affix=
+if $use_ivectors; then
+  ivector_affix=".ivector"
 fi
+
 lmexpdir=exp/train_rnnlm_${backend}_${lmtag}
-lm_train_set=data/local/train.txt
-lm_valid_set=data/local/dev.txt
 
 recog_set=""
 for l in ${recog}; do
@@ -212,69 +214,20 @@ if [ ${stage} -le 2 ]; then
     | sort | uniq | grep -v -e '^\s*$' | grep -v '<unk>' | awk '{print $0 " " NR+1}' >> ${dict}
     wc -l ${dict}
     
-    ivector_opts=
-    if $use_ivectors; then
-      ivector_opts="--ivectors ${feat_tr_dir}/ivectors_online.scp"
-    fi
     
     echo "make json files"
-    mkjson.py --non-lang-syms ${nlsyms} ${ivector_opts} \
-              ${feat_tr_dir}/feats.scp data/${train_set} ${dict} \
-              > ${feat_tr_dir}/data.json
-
-    
-    mkjson.py --non-lang-syms ${nlsyms} ${ivector_opts} \
-              ${feat_dt_dir}/feats.scp data/${train_dev} ${dict} \
-              > ${feat_dt_dir}/data.json
-
-    for rtask in ${recog_set}; do
+    for rtask in ${train_set} ${train_dev} ${recog_set}; do
         feat_recog_dir=${dumpdir}/${rtask}/delta${do_delta}
+        ivector_opts=
+        if $use_ivectors; then
+            ivector_opts="--ivectors ${feat_recog_dir}/ivectors_online.scp" 
+        fi
+
         mkjson.py --non-lang-syms ${nlsyms} ${ivector_opts} \
               ${feat_recog_dir}/feats.scp data/${rtask} ${dict} \
-              > ${feat_recog_dir}/data.json
+              > ${feat_recog_dir}/data${ivector_affix}.json
     done
 fi
-
-
-if $use_lm; then
-  lm_train_set=data/local/train.txt
-  lm_valid_set=data/local/dev.txt
-
-  # Make train and valid
-  text2token.py --nchar 1 \
-                --space "<space>" \
-                --non-lang-syms data/lang_1char/non_lang_syms.txt \
-                <(cut -d' ' -f2- data/${train_set}/text | head -100) \
-                > ${lm_train_set}
-
-  text2token.py --nchar 1 \
-                --space "<space>" \
-                --non-lang-syms data/lang_1char/non_lang_syms.txt \
-                <(cut -d' ' -f2- data/${train_dev}/text | head -100) \
-                > ${lm_valid_set}
-
-  if [ ${ngpu} -gt 1 ]; then
-        echo "LM training does not support multi-gpu. signle gpu will be used."
-  fi
-
-  ${cuda_cmd} --gpu ${ngpu} ${lmexpdir}/train.log \
-          lm_train.py \
-          --ngpu ${ngpu} \
-          --backend ${backend} \
-          --verbose 1 \
-          --outdir ${lmexpdir} \
-          --train-label ${lm_train_set} \
-          --valid-label ${lm_valid_set} \
-          --resume ${lm_resume} \
-          --layer ${lm_layers} \
-          --unit ${lm_units} \
-          --opt ${lm_opt} \
-          --batchsize ${lm_batchsize} \
-          --epoch ${lm_epochs} \
-          --maxlen ${lm_maxlen} \
-          --dict ${dict}
-fi
-
 
 if [ -z ${tag} ]; then
     expdir=exp/${train_set}_${backend}_${etype}_e${elayers}_subsample${subsample}_unit${eunits}_proj${eprojs}_d${dlayers}_unit${dunits}_${atype}_aconvc${aconv_chans}_aconvf${aconv_filts}_mtlalpha${mtlalpha}_${opt}_bs${batchsize}_mli${maxlen_in}_mlo${maxlen_out}
@@ -289,6 +242,11 @@ mkdir -p ${expdir}
 if [ ${stage} -le 3 ]; then
     echo "stage 3: Network Training"
 
+    extra_opts=
+    if $freeze; then
+      extra_opts="--freeze"
+    fi
+
     ${cuda_cmd} --gpu ${ngpu} ${expdir}/train.log \
         asr_train.py \
         --ngpu ${ngpu} \
@@ -301,8 +259,8 @@ if [ ${stage} -le 3 ]; then
         --verbose ${verbose} \
         --resume ${resume} \
         --seed ${seed} \
-        --train-json ${feat_tr_dir}/data.json \
-        --valid-json ${feat_dt_dir}/data.json \
+        --train-json ${feat_tr_dir}/data${ivector_affix}.json \
+        --valid-json ${feat_dt_dir}/data${ivector_affix}.json \
         --etype ${etype} \
         --elayers ${elayers} \
         --eunits ${eunits} \
@@ -312,7 +270,7 @@ if [ ${stage} -le 3 ]; then
         --tdnn-odims "${tdnn_odims}" \
         --tdnn-prefinal-affine-dim ${tdnn_prefinal_affine_dim} \
         --tdnn-final-affine-dim ${tdnn_final_affine_dim} \
-        --kaldi-mdl ${kaldi_mdl} \
+        --kaldi-mdl "${kaldi_mdl}" \
         --dlayers ${dlayers} \
         --dunits ${dunits} \
         --atype ${atype} \
@@ -328,17 +286,21 @@ if [ ${stage} -le 3 ]; then
         --maxlen-in ${maxlen_in} \
         --maxlen-out ${maxlen_out} \
         --opt ${opt} \
-        --epochs ${epochs}
+        --epochs ${epochs} ${extra_opts}
 fi
 
 
 if [ ${stage} -le 4 ]; then
     echo "stage 4: Decoding"
-    nj=64
+    nj=32
 
-    extra_opts=""
+    recog_opts=""
     if $use_lm; then
-      extra_opts="--rnnlm ${lmexpdir}/rnnlm.model.best --lm-weight ${lm_weight} ${extra_opts}"
+      if $use_wordlm; then
+        recog_opts="--word-rnnlm ${lmexpdir}/rnnlm.model.best --lm-weight ${lm_weight}"
+      else
+        recog_opts="--rnnlm ${lmexpdir}/rnnlm.model.best --lm-weight ${lm_weight}"
+      fi
     fi
 
     for rtask in ${recog_set}; do
@@ -347,10 +309,11 @@ if [ ${stage} -le 4 ]; then
         if $use_lm; then
             decode_dir=${decode_dir}_rnnlm${lm_weight}_${lmtag}
         fi
+
         feat_recog_dir=${dumpdir}/${rtask}/delta${do_delta}
 
         # split data
-        splitjson.py --parts ${nj} ${feat_recog_dir}/data.json
+        splitjson.py --parts ${nj} ${feat_recog_dir}/data${ivector_affix}.json
 
         #### use CPU for decoding
         ngpu=0
@@ -367,7 +330,7 @@ if [ ${stage} -le 4 ]; then
             --ctc-weight ${ctc_weight} \
             --maxlenratio ${maxlenratio} \
             --minlenratio ${minlenratio} \
-            ${extra_opts} &
+            ${recog_opts} &
         wait
 
         score_sclite.sh --wer true --nlsyms ${nlsyms} ${expdir}/${decode_dir} ${dict}

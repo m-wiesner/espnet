@@ -266,7 +266,7 @@ class E2E(torch.nn.Module):
         self.init_like_chainer()
 
     
-    def init_kaldi(self, net):
+    def init_kaldi(self, net, freeze=False):
         for c_name, c_comp in net['Nnet3']['components'].items():
             idim = c_comp['idim']
             odim = c_comp['odim']
@@ -277,13 +277,10 @@ class E2E(torch.nn.Module):
                 for i in range(3):
                     self.enc.ivector_mixer.W.weight.data[:, :, i] = torch.Tensor(c_comp['LinearParams'][:, i*self.idim:(i+1)*self.idim])
                 self.enc.ivector_mixer.W.bias.data = torch.Tensor(c_comp['BiasParams'])
-                #self.enc.ivector_mixer.W.weight.requires_grad = False
-                #self.enc.ivector_mixer.W.bias.requires_grad = False 
                 
                 # ivectors
                 if self.ivector_dim is not None:
                     self.enc.ivector_mixer.V.weight.data[:, :, 0] = torch.Tensor(c_comp['LinearParams'][:, -self.ivector_dim:])
-                    #self.enc.ivector_mixer.V.weight.requires_grad = False 
 
                 
             #########################################
@@ -337,6 +334,12 @@ class E2E(torch.nn.Module):
                     continue;
                 self.enc.enc1.batchnorm[layer_num].running_mean = torch.Tensor(c_comp['running_mean'])  
                 self.enc.enc1.batchnorm[layer_num].running_var = torch.Tensor(c_comp['running_var'])
+
+            if freeze:
+                for name, p in self.enc.named_parameters():
+                    if name != "conversion_affine":
+                        p.requires_grad = False
+
 
 
     def init_like_chainer(self):

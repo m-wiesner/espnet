@@ -248,7 +248,7 @@ def train(args):
 
     if args.kaldi_mdl != '' and args.etype == 'tdnn':
         kaldi_net = import_kaldi(args.kaldi_mdl)
-        e2e.init_kaldi(kaldi_net)
+        e2e.init_kaldi(kaldi_net, freeze=args.freeze)
     
     model = Loss(e2e, args.mtlalpha)
 
