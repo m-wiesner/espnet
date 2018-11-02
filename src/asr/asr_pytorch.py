@@ -9,6 +9,8 @@ import json
 import logging
 import math
 import os
+import random
+import codecs
 
 # chainer related
 import chainer
@@ -27,7 +29,9 @@ from asr_utils import add_results_to_json
 from asr_utils import CompareValueTrigger
 from asr_utils import get_model_conf
 from asr_utils import load_inputs_and_targets
+from asr_utils import load_inputs_and_targets_augment
 from asr_utils import make_batchset
+from asr_utils import make_augment_batchset
 from asr_utils import PlotAttentionReport
 from asr_utils import restore_snapshot
 from asr_utils import torch_load
@@ -50,7 +54,7 @@ import matplotlib
 import numpy as np
 matplotlib.use('Agg')
 
-REPORT_INTERVAL = 100
+REPORT_INTERVAL = 4
 
 
 class CustomEvaluator(extensions.Evaluator):
@@ -86,7 +90,7 @@ class CustomEvaluator(extensions.Evaluator):
                     # x: original json with loaded features
                     #    will be converted to chainer variable later
                     x = self.converter(batch, self.device)
-                    self.model(*x)
+                    self.model(*x, aug=False)
                 summary.add(observation)
         self.model.train()
 
@@ -135,6 +139,97 @@ class CustomUpdater(training.StandardUpdater):
             optimizer.step()
 
 
+# Controls GAN PSDA / MMDA
+class GANUpdater(training.StandardUpdater):
+    '''
+        Updater for GAN PSDA / MMDA
+    '''
+    def __init__(self, model, grad_clip_threshold, train_iter,
+                 optimizer, converter, device, ngpu, aug_params, gan_params):
+        super(GANUpdater, self).__init__(train_iter, optimizer)
+        
+        # Class Attributes
+        self.model = model
+        self.grad_clip_threshold = grad_clip_threshold
+        self.converter = converter
+        self.device = device
+        self.ngpu = ngpu
+        self.sources = train_iter.keys()
+
+        # Augment Attributes
+        self.aug_params = aug_params # Dict of all augmenting params
+        self.done_augment = 0 # Counter for number of completed aug batches
+        self.done_audio = 0   # Counter for number of completed audio batches
+        self.done_pretrain_aug = 0 # Counter for pretrain aug batches completed
+        self.gan_params = gan_params
+   
+    def _do_aug_batch(self):
+        is_pretrain = (self.done_pretrain_aug < self.aug_params['pretrain'])
+        self.done_pretrain_aug += is_pretrain 
+        is_rand_aug = random.random() < self.aug_params['rat'] 
+        return is_pretrain or is_rand_aug
+    
+    def update_core(self): 
+        # Select source using self.augment_params
+        if self._do_aug_batch():
+            batch = self.get_iterator('aug').next()
+            x = self.converter['aug'](batch, self.device)
+            is_aug = True
+        else: 
+            train_iter = self.get_iterator('main')
+            batch = train_iter.next()
+            x = self.converter['main'](batch, self.device)
+            is_aug = False
+
+        # Compute the loss at this time step and accumulate it
+        print("Pretrain: ", self.done_pretrain_aug, "AUG: ", is_aug)
+        self.get_optimizer('main').zero_grad()  # Clear the parameter gradients
+        loss = 1. / self.ngpu * self.model(*x, aug=is_aug)
+        if self.ngpu > 1:
+            loss.backward(loss.new_ones(self.ngpu))  # Backprop
+        else:
+            loss.backward()  # Backprop
+        loss.detach()  # Truncate the graph
+        
+        # compute the gradient norm to check if it is normal or not
+        # We are only considering those parameters not in the discriminator
+        grad_norm = torch.nn.utils.clip_grad_norm_(
+            [i[1] for i in self.model.named_parameters() if 'discrim' not in i[0]],
+            self.grad_clip_threshold)
+        logging.info('grad norm={}'.format(grad_norm))
+        if math.isnan(grad_norm):
+            logging.warning('grad norm is nan. Do not update model.')
+        else:
+            self.get_optimizer('main').step()
+
+        if self.gan_params['weight'] > 0.0:
+            ys_gan = torch.tensor((), dtype=torch.float32)
+            if _do_aug_batch:
+                fake_label = self.gan_params['smooth'] * random.random()
+                ys_gan = (fake_label * ys_gan.new_ones((len(x[2]), 1))).to(self.device)
+                x_, ilens_ = self.model.predictor.generator(x[0], x[1])
+                loss = (1. / self.ngpu) * self.model.predictor.discriminator(x_.detatch(), ilens_, ys_gan) 
+            else:
+                real_label = 1.0 + self.gan_params['smooth'] * (random.random() - 1)
+                ys_gan = (real_label * ys_gan.new_ones((len(x[2]), 1))).to(self.device)
+                loss = (1. / self.ngpu) * self.model.predictor.discriminator(x[0], x[1], ys_gan) 
+             
+            self.get_optimizer('gan').zero_grad()  # Clear the parameter gradients
+            if self.ngpu > 1:
+                loss.backward(loss.new_ones(self.ngpu))  # Backprop
+            else:
+                loss.backward()  # Backprop
+            loss.detach()  # Truncate the graph
+            grad_norm = torch.nn.utils.clip_grad_norm_(
+                self.model.predictor.discriminator.parameters(),
+                self.grad_clip_threshold)
+            logging.info('grad norm={}'.format(grad_norm))
+            if math.isnan(grad_norm):
+                logging.warning('grad norm is nan. Do not update model.')
+            else:
+                self.get_optimizer('gan').step()
+
+
 class CustomConverter(object):
     """CUSTOM CONVERTER"""
 
@@ -159,6 +254,42 @@ class CustomConverter(object):
 
         # perform padding and convert to tensor
         xs_pad = pad_list([torch.from_numpy(x).float() for x in xs], 0).to(device)
+        ilens = torch.from_numpy(ilens).to(device)
+        ys_pad = pad_list([torch.from_numpy(y).long() for y in ys], self.ignore_id).to(device)
+
+        return xs_pad, ilens, ys_pad
+
+
+class AugmentConverter(object):
+    """Augment CONVERTER"""
+
+    def __init__(self, idict, odict, ifile, ofile, expand_iline=4, subsamping_factor=1):
+        self.subsamping_factor = subsamping_factor
+        self.ignore_id = -1
+        self.idict = idict
+        self.odict = odict
+        self.ifile = codecs.open(ifile, 'r', encoding='utf-8')
+        self.ofile = codecs.open(ofile, 'r', encoding='utf-8')
+        self.expand_iline = expand_iline
+
+    def transform(self, item):
+        return load_inputs_and_targets_augment(item, self.idict, self.odict,
+                                 self.ifile, self.ofile, self.expand_iline)
+
+    def __call__(self, batch, device):
+        # batch should be located in list
+        assert len(batch) == 1
+        xs, ys = batch[0]
+
+        # perform subsamping
+        if self.subsamping_factor > 1:
+            xs = [x[::self.subsampling_factor, :] for x in xs]
+
+        # get batch of lengths of input sequences
+        ilens = np.array([x.shape[0] for x in xs])
+
+        # perform padding and convert to tensor
+        xs_pad = pad_list([torch.from_numpy(x) for x in xs], 0).to(device)
         ilens = torch.from_numpy(ilens).to(device)
         ys_pad = pad_list([torch.from_numpy(y).long() for y in ys], self.ignore_id).to(device)
 
@@ -197,6 +328,14 @@ def train(args):
     logging.info('#input dims : ' + str(idim))
     logging.info('#output dims: ' + str(odim))
 
+    
+    if args.tdnn_offsets != '':
+        args.tdnn_offsets = [[int(o) for o in l.split(',')] for l in args.tdnn_offsets.split()]
+    if args.tdnn_odims != '':
+        args.tdnn_odims = [int(d) for d in args.tdnn_odims.split()]
+    if len(args.tdnn_odims) != len(args.tdnn_offsets):
+        sys.exit("Arguments are not right")
+
     # specify attention, CTC, hybrid mode
     if args.mtlalpha == 1.0:
         mtl_mode = 'ctc'
@@ -210,7 +349,7 @@ def train(args):
 
     # specify model architecture
     e2e = E2E(idim, odim, args)
-    model = Loss(e2e, args.mtlalpha)
+    model = Loss(e2e, args.mtlalpha, args.gan_weight)
 
     # write model config
     if not os.path.exists(args.outdir):
@@ -236,24 +375,55 @@ def train(args):
     model = model.to(device)
 
     # Setup an optimizer
+    optimizer = {}
     if args.opt == 'adadelta':
-        optimizer = torch.optim.Adadelta(
+        optimizer['main'] = torch.optim.Adadelta(
             model.parameters(), rho=0.95, eps=args.eps)
+        if args.aug_use:
+            optimizer['aug'] = torch.optim.Adadelta(model.predictor.generator.parameters(), rho=0.95, eps=args.eps)
     elif args.opt == 'adam':
-        optimizer = torch.optim.Adam(model.parameters())
+        optimizer['main'] = torch.optim.Adam(model.parameters())
+        if args.aug_use:
+            optimizer['aug'] = torch.optim.Adam(model.predictor.generator.parameters())
 
+    if args.gan_weight > 0.0 and args.aug_use:
+        optimizer['gan'] = torch.optim.SGD(model.predictor.discriminator.parameters(), lr=0.005, momentum=0.8)
+        reporter_discrim = model.predictor.discriminator.reporter
+    
     # FIXME: TOO DIRTY HACK
-    setattr(optimizer, "target", reporter)
-    setattr(optimizer, "serialize", lambda s: reporter.serialize(s))
+    setattr(optimizer['main'], "target", reporter)
+    setattr(optimizer['main'], "serialize", lambda s: reporter.serialize(s))
+    
+    if args.aug_use:
+        setattr(optimizer['aug'], "target", reporter)
+        setattr(optimizer['aug'], "serialize", lambda s: reporter.serialize(s))
+
+    if args.gan_weight > 0.0 and args.aug_use:
+        setattr(optimizer['gan'], "target", reporter_discrim)
+        setattr(optimizer['gan'], "serialize", lambda s: reporter_discrim.serialize(s))
 
     # Setup a converter
-    converter = CustomConverter(e2e.subsample[0])
-
+    converter = CustomConverter(e2e.subsample[0])		
+    
     # read json data
     with open(args.train_json, 'rb') as f:
         train_json = json.load(f)['utts']
     with open(args.valid_json, 'rb') as f:
         valid_json = json.load(f)['utts']
+
+	# Augmenting Data
+    if os.path.exists(args.aug_train) and args.aug_use:
+        with codecs.open(args.aug_train, 'rb', encoding='utf-8') as f:
+            augment_json = json.load(f)['aug']
+
+        train_augment, meta = make_augment_batchset(augment_json, args.batch_size,
+                                                    args.maxlen_in, args.maxlen_out,
+                                                    args.minibatches, args.subsample)        
+        converter_augment = AugmentConverter(meta['idict'], meta['odict'],
+                                             meta['ifilename'], meta['ofilename'],
+                                             expand_iline=4,
+                                             subsamping_factor=1) 
+
 
     # make minibatch list (variable length)
     train = make_batchset(train_json, args.batch_size,
@@ -262,25 +432,40 @@ def train(args):
                           args.maxlen_in, args.maxlen_out, args.minibatches)
     # hack to make batchsze argument as 1
     # actual bathsize is included in a list
+    train_iter = {}
     if args.n_iter_processes > 0:
-        train_iter = chainer.iterators.MultiprocessIterator(
+        train_iter['main'] = chainer.iterators.MultiprocessIterator(
             TransformDataset(train, converter.transform),
             batch_size=1, n_processes=args.n_iter_processes, n_prefetch=8, maxtasksperchild=20)
         valid_iter = chainer.iterators.MultiprocessIterator(
             TransformDataset(valid, converter.transform),
             batch_size=1, repeat=False, shuffle=False,
             n_processes=args.n_iter_processes, n_prefetch=8, maxtasksperchild=20)
+        if args.aug_use:
+            train_iter['aug'] = chainer.iterators.MultiprocessIterator(
+                TransformDataset(train_augment, converter_augment.transform),
+                batch_size=1, n_process=args.n_iter_processes, n_prefetch=8, maxtasksperchild=20) 
     else:
-        train_iter = chainer.iterators.SerialIterator(
+        train_iter['main'] = chainer.iterators.SerialIterator(
             TransformDataset(train, converter.transform),
             batch_size=1)
         valid_iter = chainer.iterators.SerialIterator(
             TransformDataset(valid, converter.transform),
             batch_size=1, repeat=False, shuffle=False)
+    if args.aug_use:
+        train_iter['aug'] = chainer.iterators.SerialIterator(
+            TransformDataset(train_augment, converter_augment.transform),
+            batch_size=1)
 
     # Set up a trainer
-    updater = CustomUpdater(
-        model, args.grad_clip, train_iter, optimizer, converter, device, args.ngpu)
+    if args.aug_use:
+        aug_params = {'rat': args.aug_ratio, 'pretrain': args.aug_pretrain} 
+        gan_params = {'weight': args.gan_weight, 'smooth': args.gan_smooth}
+        updater = GANUpdater(model, args.grad_clip, train_iter,
+                 optimizer, {'main': converter, 'aug': converter_augment}, device, args.ngpu, aug_params, gan_params)   
+    else:
+        updater = CustomUpdater(
+            model, args.grad_clip, train_iter, optimizer, converter, device, args.ngpu)
     trainer = training.Trainer(
         updater, (args.epochs, 'epoch'), out=args.outdir)
 
@@ -315,8 +500,15 @@ def train(args):
     # Save best models
     trainer.extend(extensions.snapshot_object(model, 'model.loss.best', savefun=torch_save),
                    trigger=training.triggers.MinValueTrigger('validation/main/loss'))
+    
+    trainer.extend(extensions.snapshot_object(model, 'model.loss.best_{.updater.epoch}', savefun=torch_save),
+                   trigger=training.triggers.MinValueTrigger('validation/main/loss'))
+
     if mtl_mode is not 'ctc':
         trainer.extend(extensions.snapshot_object(model, 'model.acc.best', savefun=torch_save),
+                       trigger=training.triggers.MaxValueTrigger('validation/main/acc'))
+
+        trainer.extend(extensions.snapshot_object(model, 'model.acc.best_{.updater.epoch}', savefun=torch_save),
                        trigger=training.triggers.MaxValueTrigger('validation/main/acc'))
 
     # save snapshot which contains model and optimizer states
@@ -345,7 +537,7 @@ def train(args):
 
     # Write a log of evaluation statistics for each epoch
     trainer.extend(extensions.LogReport(trigger=(REPORT_INTERVAL, 'iteration')))
-    report_keys = ['epoch', 'iteration', 'main/loss', 'main/loss_ctc', 'main/loss_att',
+    report_keys = ['epoch', 'iteration', 'main/loss', 'main/loss_ctc', 'main/loss_att', 'main/loss_gan', 'gan/loss_discrim'
                    'validation/main/loss', 'validation/main/loss_ctc', 'validation/main/loss_att',
                    'main/acc', 'validation/main/acc', 'elapsed_time']
     if args.opt == 'adadelta':
@@ -360,7 +552,9 @@ def train(args):
 
     # Run the training
     trainer.run()
-
+    if args.aug_use:
+        converter_augment.ifile.close()
+        converter_augment.ofile.close()
 
 def recog(args):
     '''Run recognition'''

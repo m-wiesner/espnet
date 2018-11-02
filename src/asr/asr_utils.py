@@ -9,6 +9,7 @@ import logging
 import os
 import shutil
 import tempfile
+import pdb
 
 import numpy as np
 import torch
@@ -27,6 +28,49 @@ import kaldi_io_py
 # matplotlib related
 import matplotlib
 matplotlib.use('Agg')
+
+
+def make_augment_batchset(data, batch_size,
+                          max_length_in, max_length_out,
+                          num_batches=0, subsample=1):
+    # sort it by input lengths (long to short)
+    # data has keys ifilename, ofilename, sentences
+    # sentences has keys id, and values ilen, olen, ioffset, ooffset
+    # ifilename = data['ifilename']
+    # ofilename = data['ofilename']
+    # idict = data['idict']
+    # odict = data['odict']
+    meta = {'ifilename': data['ifilename'],
+            'ofilename': data['ofilename'],
+            'idict': data['idict'],
+            'odict': data['odict']}
+    assert '<unk>' in data['odict']
+    sentences = data['sentences']
+    sorted_data = sorted(sentences.items(), key=lambda data: int(
+        data[1]['ilen']), reverse=True)
+    logging.info('# augmenting data: ' + str(len(sorted_data)))
+    if subsample == 1:
+        len_fac = 1
+    else:
+        len_fac = np.prod([int(i) for i in subsample.split('_')])
+    # change batchsize depending on the input and output length
+    minibatches = []
+    start = 0
+    while True:
+        ilen = int(sorted_data[start][1]['ilen'])
+        olen = int(sorted_data[start][1]['olen'])
+        ilen *= len_fac
+        factor = max(int(ilen / max_length_in), int(olen / max_length_out))
+        b = max(1, int(batch_size / (1 + factor)))
+        end = start + b  # (start + b) if (start + b < len(sorted_data)) else len(sorted_data)
+        minibatches.append(sorted_data[start:end])
+        if end >= len(sorted_data):
+            break
+        start = end
+    if num_batches > 0:
+        minibatches = minibatches[:num_batches]
+    logging.info('# augmenting data minibatches: ' + str(len(minibatches)))
+    return minibatches, meta
 
 
 # * -------------------- training iterator related -------------------- *
@@ -86,6 +130,36 @@ def load_inputs_and_targets(batch):
     return xs, ys
 
 
+def load_inputs_and_targets_augment(batch, idict, odict, ifile, ofile, expand_iline):
+    xs, ys = [], []
+    for b_idx, b_obj in batch:
+        ifile.seek(b_obj['ioffset'])
+        ofile.seek(b_obj['ooffset'])
+        iline = ifile.readline()
+        oline = ofile.readline()
+        iline_items = iline.strip().split()
+        iline_items = [item for item in iline.strip().split() for i in range(expand_iline)]
+        iline = ['<s>'] + iline_items + ['</s>']  # BOS and EOS for output handled by decoder
+        iline = [idict[i] for i in iline]
+        if len(iline) <= 2:
+            print(b_obj)
+            print(iline_items)
+            assert len(iline) > 2
+        iline = np.array(iline, dtype=np.int64)
+        # oline = oline.strip().split()[1:]  # so that we can use the same aug files from OpenNMT, removed "aug"
+        oline = oline.strip().split()  # so that we can use the same aug files from OpenNMT
+        oline = [odict.get(i, odict['<unk>']) for i in oline]
+        xs.append(iline)
+        ys.append(np.array(oline))
+    return xs, ys
+
+
+def delete_feat_augment(batch):
+    for data in batch:
+        del data[1]['feat']
+        del data[1]['output']
+
+    return batch
 # * -------------------- chainer extension related -------------------- *
 class CompareValueTrigger(object):
     '''Trigger invoked when key value getting bigger or lower than before

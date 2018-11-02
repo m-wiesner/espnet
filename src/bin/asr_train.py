@@ -11,6 +11,7 @@ import platform
 import random
 import subprocess
 import sys
+import codecs
 
 import numpy as np
 
@@ -47,7 +48,7 @@ def main():
     # network archtecture
     # encoder
     parser.add_argument('--etype', default='blstmp', type=str,
-                        choices=['blstm', 'blstmp', 'vggblstmp', 'vggblstm'],
+                        choices=['tdnn', 'blstm', 'blstmp', 'vggblstmp', 'vggblstm'],
                         help='Type of encoder network architecture')
     parser.add_argument('--elayers', default=4, type=int,
                         help='Number of encoder layers')
@@ -57,7 +58,19 @@ def main():
                         help='Number of encoder projection units')
     parser.add_argument('--subsample', default=1, type=str,
                         help='Subsample input frames x_y_z means subsample every x frame at 1st layer, '
-                             'every y frame at 2nd layer etc.')
+                             'every y frame at 2nd layer etc.')  
+    # Encoder TDNN 
+    parser.add_argument('--tdnn-odims', default='', type=str,
+                        action='store', required=False, help='specify the output dimension of each tdnn layer')
+    parser.add_argument('--tdnn-offsets', default='', type=str,
+                        action='store', required=False, help='specify the offsets for each layer in the tdnn')
+    parser.add_argument('--tdnn-prefinal-affine-dim', default=625, type=int,
+                        action='store', required=False,
+                        help='tdnn prefinal affine dimension')
+    parser.add_argument('--tdnn-final-affine-dim', default=300, type=int,
+                        action='store', required=False,
+                        help='tdnn final affine dimension')
+
     # loss
     parser.add_argument('--ctc_type', default='warpctc', type=str,
                         choices=['chainer', 'warpctc'],
@@ -129,6 +142,27 @@ def main():
                         help='Gradient norm threshold to clip')
     parser.add_argument('--num-save-attention', default=3, type=int,
                         help='Number of samples of attention to be saved')
+
+    # Aug related
+    parser.add_argument('--aug-use', type=int, choices=set([0, 1]), default=0,
+                        help='enables or disables augment based training')
+    parser.add_argument('--aug-train', type=str, required=False, default='', nargs='?',
+                        help='Filename of aug data (json)')
+    parser.add_argument('--aug-dict', type=str, required=False, default='', nargs='?',
+                        help='Filename of aug input dictionary')
+    parser.add_argument('--aug-ratio', default=0.5, type=float,
+                        help='aug to real data ratio (smaller number means less aug batches)')
+    parser.add_argument('--aug-pretrain', default=0, type=int,
+                        help='number of aug batches before audio batches')
+    parser.add_argument('--aug-idim', default=83, type=int,
+                        help='augment symbol embedding dim')
+    
+    # GAN related
+    parser.add_argument('--gan-weight', default=0.0, type=float, help='Amount of GAN loss')
+    parser.add_argument('--gan-smooth', default=0.3, type=float, help='Amount of GAN loss')
+    parser.add_argument('--gan-wsize', default=20, type=float, help='Window size for GAN loss')
+    parser.add_argument('--gan-odim', default=128, type=float, help='Dimension of discriminator outputs (prefinal layer)') 
+
     args = parser.parse_args()
 
     # logging info
@@ -180,6 +214,14 @@ def main():
         args.char_list = char_list
     else:
         args.char_list = None
+
+    if args.aug_dict != '' and args.aug_use == 1:
+        with codecs.open(args.aug_dict, 'r', encoding='utf-8') as f:
+            aug_dictionary = f.readlines()
+        args.aug_vocab_size = len(aug_dictionary)
+    else:
+        args.aug_vocab_size = None
+
 
     # train
     logging.info('backend = ' + args.backend)
