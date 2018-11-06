@@ -286,8 +286,8 @@ def adadelta_eps_decay(eps_decay):
     return adadelta_eps_decay
 
 
-def _adadelta_eps_decay(trainer, eps_decay):
-    optimizer = trainer.updater.get_optimizer('main')
+def _adadelta_eps_decay(trainer, eps_decay, name='main'):
+    optimizer = trainer.updater.get_optimizer(name)
     # for chainer
     if hasattr(optimizer, 'eps'):
         current_eps = optimizer.eps

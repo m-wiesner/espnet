@@ -120,15 +120,15 @@ class Loss(torch.nn.Module):
     :param float mtlalpha: mtl coefficient value (0.0 ~ 1.0)
     """
 
-    def __init__(self, predictor, mtlalpha, gan_alpha):
+    def __init__(self, predictor, mtlalpha):
         super(Loss, self).__init__()
         assert 0.0 <= mtlalpha <= 1.0, "mtlalpha shoule be [0.0, 1.0]"
         self.mtlalpha = mtlalpha
-        self.gan_alpha = gan_alpha
         self.loss = None
         self.accuracy = None
         self.predictor = predictor
         self.reporter = Reporter()
+        self.aug_reporter = Reporter()
 
     def forward(self, xs_pad, ilens, ys_pad, aug=False):
         '''Multi-task learning loss forward
@@ -139,10 +139,10 @@ class Loss(torch.nn.Module):
         :return: loss value
         :rtype: torch.Tensor
         '''
+        batch_reporter = self.reporter if not aug else self.aug_reporter 
         self.loss = None
-        loss_ctc, loss_att, loss_gan, acc = self.predictor(xs_pad, ilens, ys_pad, aug=aug)
+        loss_ctc, loss_att, acc = self.predictor(xs_pad, ilens, ys_pad)
         alpha = self.mtlalpha
-        gan_alpha = self.gan_alpha
         if alpha == 0:
             self.loss = loss_att
             loss_att_data = ('loss_att', float(loss_att))
@@ -156,18 +156,12 @@ class Loss(torch.nn.Module):
             loss_att_data = ('loss_att', float(loss_att))
             loss_ctc_data = ('loss_ctc', float(loss_ctc))
 
-        # Add GAN loss
-        loss_gan_data = None
-        if gan_alpha != 0 and loss_gan is not None:
-            self.loss += gan_alpha * loss_gan
-            loss_gan_data = ('loss_gan', float(loss_gan))            
-
         loss_data = ('loss', float(self.loss))
         acc_data = ('acc', acc) 
-        if loss_data[0] < CTC_LOSS_THRESHOLD and not math.isnan(loss_data[0]):
-            self.reporter.report(dict([loss_att_data, loss_ctc_data, loss_gan_data, acc_data]))
-        else:
-            logging.warning('loss (=%f) is not correct', loss_data[1])
+        #if loss_data[0] < CTC_LOSS_THRESHOLD and not math.isnan(loss_data[0]):
+        batch_reporter.report(dict([loss_data, loss_att_data, loss_ctc_data, acc_data]))
+        #else:
+        #logging.warning('loss (=%f) is not correct', loss_data[1])
 
         return self.loss
 
@@ -186,38 +180,53 @@ class Discriminator(torch.nn.Module):
         self.output_layer = torch.nn.Linear(odim * window_size, 1)
         self.reporter = Reporter()
     
-    def forward(self, xs, ilens, ys, discrim=True):
+    def forward(self, xs, ilens, ys):
         # randomly sample num_windows patches of window length window 
         xpad, ilens = self.enc(xs, ilens)
-        # Grab a patch close to the middle 
-        patch_min = max((0, (xpad[0].shape[1] // 2) - 2 * self.window_size))
-        patch_max = min((xpad[0].shape[1] - (self.window_size + 1),
-                        (xpad[0].shape[1] // 2) + 2 * self.window_size))
+        # Grab a patch close to the middle
+        patch_min = max((0, (xpad.shape[1] // 2) - 2 * self.window_size))
+        patch_max = max((0, min((xpad.shape[1] - (self.window_size + 1),
+                        (xpad.shape[1] // 2) + 2 * self.window_size))))
+        
         patch_start = random.randint(patch_min, patch_max)
-        patch = xpad[0][:, patch_start:patch_start + self.window_size, :].view(xpad[0].shape[0], -1)
+        #assert patch_start + self.window_size < xpad.shape[1], "End of Patch is longer than length"
+        patch = xpad[:, patch_start:patch_start + self.window_size, :].view(xpad.shape[0], -1)
         output = self.output_layer(patch)
+        report_val = True
         loss = torch.mean((output - ys)**2)
-        if discrim:
-            self.reporter.report(dict([('loss_discrim', float(loss))]))
         return loss
 
 
 class Generator(torch.nn.Module):
-    def __init__(self, vocab_size, idim, odim):
+    def __init__(self, vocab_size, idim, odim, args):
         super(Generator, self).__init__()
         # Embeds categorical features in a vector space. Keep idim small.
         self.embedding = torch.nn.Embedding(vocab_size, idim)
-        
+        subsample = np.ones(args.elayers + 1, dtype=np.int)
+        if args.etype == 'blstmp':
+            ss = args.subsample.split("_")
+            for j in range(min(args.elayers + 1, len(ss))):
+                subsample[j] = int(ss[j])
+        else:
+            logging.warning(
+                'Subsampling is not performed for vgg*. It is performed in max pooling layers at CNN.')
+        logging.info('subsample: ' + ' '.join([str(x) for x in subsample]))
+        self.subsample = subsample
+
         # TDNN parameters
-        tdnn_layer_dims = [1024, 1024, 1024, 1024, 1024,
-                           1024, 1024, 1024, 1024, 1024]
-        tdnn_offsets = [[-1, 0, 1], [-1, 0, 1], [-1, 0, 1], [-3, 0, 3], [-3, 0, 3],
-                       [-3, 0, 3], [-3, 0, 3], [-3, 0, 3], [-3, 0, 3], [-3, 0, 3]]
+        #if gtype == 'tdnn':
+        #tdnn_layer_dims = [1024, 1024, 1024, 1024, 1024,
+        #                1024, 1024, 1024, 1024, 1024]
+        #tdnn_offsets = [[-1, 0, 1], [-1, 0, 1], [-1, 0, 1], [-3, 0, 3], [-3, 0, 3],
+        #            [-3, 0, 3], [-3, 0, 3], [-3, 0, 3], [-3, 0, 3], [-3, 0, 3]]
 
-        self.enc = TDNN(idim, odim, odims=tdnn_layer_dims,
-                        offsets=tdnn_offsets, prefinal_affine_dim=624,
-                        final_affine_dim=300, nonlin=F.leaky_relu)
-
+        #self.enc = TDNN(idim, odim, odims=tdnn_layer_dims,
+        #                offsets=tdnn_offsets, prefinal_affine_dim=624,
+        #                final_affine_dim=300, nonlin=F.leaky_relu, subsample=1)
+        #elif gtype == 'enc':
+        self.enc = Encoder(args.gtype, idim, args.elayers, args.eunits, odim,
+                           self.subsample, 0.0)
+  
     def forward(self, xs, ilens):
         xs = self.embedding(xs)
         xs, ilens = self.enc(xs, ilens)
@@ -228,15 +237,16 @@ class TDNN(torch.nn.Module):
     '''
         Kaldi TDNN style encoder implemented as convolutions
     '''
-    def __init__(self, idim, odim, odims=[1024, 1024, 1024, 1024, 1024, 1024, 1024], prefinal_affine_dim=1024, final_affine_dim=300,
+    def __init__(self, idim, odim, odims=[625, 625, 625, 625, 625, 625, 625], prefinal_affine_dim=625, final_affine_dim=300,
                              offsets=[[0], [-1, 0, 1], [-1, 0, 1], [-3, 0, 3], [-3, 0, 3], [-3, 0, 3], [-3, 0, 3]], nonlin=F.relu, 
-                             dropout=0.5):
+                             dropout=0.5, subsample=3):
         super(TDNN, self).__init__()
         
         # Proper TDNN layers
         odims_ = list(odims)
         odims_.insert(0, idim)
         self.dropout = dropout
+        self.subsample = subsample
         self.nonlin = nonlin
         self.tdnn = torch.nn.ModuleList()
         self.batchnorm = torch.nn.ModuleList()
@@ -261,7 +271,7 @@ class TDNN(torch.nn.Module):
         # Last few layers
         self.prefinal_affine = torch.nn.Conv1d(odims_[i], prefinal_affine_dim, 1, stride=1, dilation=1, bias=True, padding=0)
         self.batchnorm.append(torch.nn.BatchNorm1d(prefinal_affine_dim, eps=1e-03, affine=False))
-        self.final_affine = torch.nn.Conv1d(prefinal_affine_dim, final_affine_dim, 1, stride=3, dilation=1, bias=True, padding=0)
+        self.final_affine = torch.nn.Conv1d(prefinal_affine_dim, final_affine_dim, 1, stride=subsample, dilation=1, bias=True, padding=0)
 
         self.conversion_affine = torch.nn.Conv1d(final_affine_dim, odim, 1, stride=1, dilation=1, bias=False, padding=0)
 
@@ -285,7 +295,7 @@ class TDNN(torch.nn.Module):
         xs_pad = self.conversion_affine(xs_pad)
          
         ilens = np.array(
-            np.ceil(np.array(ilens, dtype=np.float32) / 3), dtype=np.int64).tolist()
+            np.ceil(np.array(ilens, dtype=np.float32) / self.subsample), dtype=np.int64).tolist()
   
         xs_pad = xs_pad.transpose(1, 2)
         xs_pad = xs_pad.contiguous().view(
@@ -340,13 +350,6 @@ class E2E(torch.nn.Module):
         # encoder
         self.enc = Encoder(args.etype, idim, args.elayers, args.eunits, args.eprojs,
                            self.subsample, args.dropout_rate)
-        # augmenting encoder (generator for GAN)
-        if args.aug_use:
-            self.generator = Generator(args.aug_vocab_size, args.aug_idim, idim)
-        
-        if args.gan_weight > 0.0:
-            self.discriminator = Discriminator(idim, args.gan_odim, window_size=args.gan_wsize)
-
         # ctc
         self.ctc = CTC(odim, args.eprojs, args.dropout_rate)
         # attention
@@ -441,7 +444,7 @@ class E2E(torch.nn.Module):
         for l in six.moves.range(len(self.dec.decoder)):
             set_forget_bias_to_one(self.dec.decoder[l].bias_ih)
 
-    def forward(self, xs_pad, ilens, ys_pad, aug=False):
+    def forward(self, xs_pad, ilens, ys_pad):
         '''E2E forward
 
         :param torch.Tensor xs_pad: batch of padded input sequences (B, Tmax, idim)
@@ -454,17 +457,7 @@ class E2E(torch.nn.Module):
         :return: accuracy in attention decoder
         :rtype: float
         '''
-        # 1. encoder
-        loss_gan = None
-        ys_gan = torch.tensor((), dtype=torch.float32)
-        if aug:
-            xs_pad, ilens = self.generator(xs_pad, ilens)
-            # 1 (a). GAN loss
-            if self.gan_weight > 0:
-                ys_gan = to_cuda(self, 1 * ys_gan.new_ones((len(ys), 1)))
-                loss_gan = self.discriminator(xs_pad, ilens, ys_gan, discrim=False)
-                del ys_gan
-        
+        # 1. encoder        
         hs_pad, hlens = self.enc(xs_pad, ilens)
 
         # 2. CTC loss
@@ -480,7 +473,7 @@ class E2E(torch.nn.Module):
         else:
             loss_att, acc = self.dec(hs_pad, hlens, ys_pad)
 
-        return loss_ctc, loss_att, loss_gan, acc
+        return loss_ctc, loss_att, acc
 
     def recognize(self, x, recog_args, char_list, rnnlm=None):
         '''E2E beam search

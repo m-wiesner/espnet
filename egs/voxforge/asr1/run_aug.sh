@@ -32,7 +32,7 @@ subsample=1_2_2_1_1 # skip every n frame from input to nth layers
 tdnn_offsets="-1,0,1 -1,0,1 -1,0,1 -3,0,3 -3,0,3 -3,0,3 -3,0,3"
 tdnn_odims="625 625 625 625 625 625 625"
 tdnn_prefinal_affine_dim=625
-tdnn_final_affine_dim=3000
+tdnn_final_affine_dim=300
 
 # decoder related
 dlayers=1
@@ -69,10 +69,11 @@ use_lm=false
 # decoding parameter
 beam_size=20
 penalty=0.0
-maxlenratio=0.2
-minlenratio=0.8
+maxlenratio=0.15
+minlenratio=0.6
 ctc_weight=0.0
 recog_model=acc.best # set a model to be used for decoding: 'acc.best' or 'loss.best'
+decode_nj=50
 
 # aug data
 aug_use=1
@@ -85,10 +86,11 @@ gan_weight=0.0
 gan_smooth=0.3
 gan_odim=128
 gan_wsize=20
+gan_only=false
 
 # data
 voxforge=downloads # original data directory to be stored
-lang=ca # de, en, es, fr, it, nl, pt, ru
+lang=pt # de, en, es, fr, it, nl, pt, ru
 
 # exp tag
 tag="" # tag for managing experiments.
@@ -139,7 +141,7 @@ if [ ${stage} -le 1 ]; then
     echo "stage 1: Feature Generation"
     fbankdir=fbank
     # Generate the fbank features; by default 80-dimensional fbanks with pitch on each frame
-    steps/make_fbank_pitch.sh --cmd "$train_cmd" --nj 10 data/all_${lang} exp/make_fbank/train_${lang} ${fbankdir}
+    steps/make_fbank_pitch.sh --cmd "$train_cmd" --nj 30 data/all_${lang} exp/make_fbank/train_${lang} ${fbankdir}
 
     # remove utt having more than 2000 frames or less than 10 frames or
     # remove utt having more than 200 characters or no more than 0 characters
@@ -193,7 +195,7 @@ if [ ${stage} -le 2 ]; then
     done
 fi
 
-dict_aug=data/lang_1char/aug_tr_ca_input_units.txt
+dict_aug=data/lang_1char/aug_tr_${lang}_input_units.txt
 if [ $stage -le 3 ]; then
     if [ ! -z "${aug_path}" ] && [ ${aug_use} -eq 1 ]; then
       echo "creating ${feat_tr_dir}/aug.json with augmenting data"
@@ -218,8 +220,14 @@ fi
 mkdir -p ${expdir}
 if [ ${stage} -le 4 ]; then
     echo "stage 4: Network Training"
-
-    #${cuda_cmd} --gpu ${ngpu} ${expdir}/train.log \
+    extra_opts=""
+    if $gan_only; then
+      extra_opts="--gan-only"
+    fi
+   
+    echo "GAN ONLY: ${extra_opts}"
+    
+    ${cuda_cmd} --gpu ${ngpu} ${expdir}/train.log \
         asr_train.py \
         --ngpu ${ngpu} \
         --backend ${backend} \
@@ -266,14 +274,13 @@ if [ ${stage} -le 4 ]; then
         --gan-weight ${gan_weight} \
         --gan-smooth ${gan_smooth} \
         --gan-wsize ${gan_wsize} \
-        --gan-odim ${gan_odim}
+        --gan-odim ${gan_odim} \
+        ${extra_opts}
 fi
 
-exit
 
 if [ ${stage} -le 5 ]; then
     echo "stage 5: Decoding"
-    nj=32
 
     extra_opts=""
     if $use_lm; then
@@ -286,19 +293,19 @@ if [ ${stage} -le 5 ]; then
         feat_recog_dir=${dumpdir}/${rtask}/delta${do_delta}
 
         # split data
-        splitjson.py --parts ${nj} ${feat_recog_dir}/data.${lang}.json 
+        splitjson.py --parts ${decode_nj} ${feat_recog_dir}/data.${lang}.json 
 
         #### use CPU for decoding
         ngpu=0
 
-        ${decode_cmd} JOB=1:${nj} ${expdir}/${decode_dir}/log/decode.JOB.log \
+        ${decode_cmd} JOB=1:${decode_nj} ${expdir}/${decode_dir}/log/decode.JOB.log \
             asr_recog.py \
             --ngpu ${ngpu} \
             --backend ${backend} \
-            --recog-json ${feat_recog_dir}/split${nj}utt/data.JOB.json \
+            --recog-json ${feat_recog_dir}/split${decode_nj}utt/data.JOB.json \
             --result-label ${expdir}/${decode_dir}/data.JOB.json \
             --model ${expdir}/results/model.${recog_model}  \
-            --model-conf ${expdir}/results/model.conf  \
+            --model-conf ${expdir}/results/model.json \
             --beam-size ${beam_size} \
             --penalty ${penalty} \
             --ctc-weight ${ctc_weight} \

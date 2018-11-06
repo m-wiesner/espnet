@@ -156,13 +156,18 @@ def main():
                         help='number of aug batches before audio batches')
     parser.add_argument('--aug-idim', default=83, type=int,
                         help='augment symbol embedding dim')
+    parser.add_argument('--auglayers', default=1, type=int)
+    parser.add_argument('--augunits', default=300, type=int)
+    parser.add_argument('--augprojs', default=300, type=int)
+     
     
     # GAN related
     parser.add_argument('--gan-weight', default=0.0, type=float, help='Amount of GAN loss')
     parser.add_argument('--gan-smooth', default=0.3, type=float, help='Amount of GAN loss')
-    parser.add_argument('--gan-wsize', default=20, type=float, help='Window size for GAN loss')
-    parser.add_argument('--gan-odim', default=128, type=float, help='Dimension of discriminator outputs (prefinal layer)') 
-
+    parser.add_argument('--gan-wsize', default=20, type=int, help='Window size for GAN loss')
+    parser.add_argument('--gan-odim', default=128, type=int, help='Dimension of discriminator outputs (prefinal layer)') 
+    parser.add_argument('--gan-only', action='store_true', help='Train the GAN only')
+    
     args = parser.parse_args()
 
     # logging info

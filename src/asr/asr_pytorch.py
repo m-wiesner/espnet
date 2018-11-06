@@ -40,6 +40,8 @@ from asr_utils import torch_save
 from asr_utils import torch_snapshot
 from e2e_asr_th import E2E
 from e2e_asr_th import Loss
+from e2e_asr_th import Generator
+from e2e_asr_th import Discriminator
 from e2e_asr_th import pad_list
 
 # for kaldi io
@@ -54,7 +56,7 @@ import matplotlib
 import numpy as np
 matplotlib.use('Agg')
 
-REPORT_INTERVAL = 4
+REPORT_INTERVAL = 10
 
 
 class CustomEvaluator(extensions.Evaluator):
@@ -144,12 +146,14 @@ class GANUpdater(training.StandardUpdater):
     '''
         Updater for GAN PSDA / MMDA
     '''
-    def __init__(self, model, grad_clip_threshold, train_iter,
+    def __init__(self, model, generator, discriminator, grad_clip_threshold, train_iter,
                  optimizer, converter, device, ngpu, aug_params, gan_params):
         super(GANUpdater, self).__init__(train_iter, optimizer)
         
         # Class Attributes
         self.model = model
+        self.generator = generator
+        self.discriminator = discriminator
         self.grad_clip_threshold = grad_clip_threshold
         self.converter = converter
         self.device = device
@@ -158,10 +162,12 @@ class GANUpdater(training.StandardUpdater):
 
         # Augment Attributes
         self.aug_params = aug_params # Dict of all augmenting params
-        self.done_augment = 0 # Counter for number of completed aug batches
-        self.done_audio = 0   # Counter for number of completed audio batches
-        self.done_pretrain_aug = 0 # Counter for pretrain aug batches completed
+        self.done_augment = 0.0 # Counter for number of completed aug batches
+        self.done_audio = 0.0   # Counter for number of completed audio batches
+        self.done_pretrain_aug = 0.0 # Counter for pretrain aug batches completed
         self.gan_params = gan_params
+        self.done_gan = 0.0
+        self.done_disc = 0.0
    
     def _do_aug_batch(self):
         is_pretrain = (self.done_pretrain_aug < self.aug_params['pretrain'])
@@ -169,60 +175,88 @@ class GANUpdater(training.StandardUpdater):
         is_rand_aug = random.random() < self.aug_params['rat'] 
         return is_pretrain or is_rand_aug
     
-    def update_core(self): 
-        # Select source using self.augment_params
-        if self._do_aug_batch():
-            batch = self.get_iterator('aug').next()
-            x = self.converter['aug'](batch, self.device)
-            is_aug = True
-        else: 
-            train_iter = self.get_iterator('main')
-            batch = train_iter.next()
-            x = self.converter['main'](batch, self.device)
-            is_aug = False
-
-        # Compute the loss at this time step and accumulate it
-        print("Pretrain: ", self.done_pretrain_aug, "AUG: ", is_aug)
-        self.get_optimizer('main').zero_grad()  # Clear the parameter gradients
-        loss = 1. / self.ngpu * self.model(*x, aug=is_aug)
-        if self.ngpu > 1:
-            loss.backward(loss.new_ones(self.ngpu))  # Backprop
+    def update_core(self):
+        if self.ngpu == 0:
+            scale = 1.0
         else:
-            loss.backward()  # Backprop
-        loss.detach()  # Truncate the graph
-        
-        # compute the gradient norm to check if it is normal or not
-        # We are only considering those parameters not in the discriminator
-        grad_norm = torch.nn.utils.clip_grad_norm_(
-            [i[1] for i in self.model.named_parameters() if 'discrim' not in i[0]],
-            self.grad_clip_threshold)
-        logging.info('grad norm={}'.format(grad_norm))
-        if math.isnan(grad_norm):
-            logging.warning('grad norm is nan. Do not update model.')
-        else:
-            self.get_optimizer('main').step()
-
+            scale = self.ngpu
+        # Initialize GAN targets 
+        loss_gan = 0.0
         if self.gan_params['weight'] > 0.0:
             ys_gan = torch.tensor((), dtype=torch.float32)
-            if _do_aug_batch:
-                fake_label = self.gan_params['smooth'] * random.random()
-                ys_gan = (fake_label * ys_gan.new_ones((len(x[2]), 1))).to(self.device)
-                x_, ilens_ = self.model.predictor.generator(x[0], x[1])
-                loss = (1. / self.ngpu) * self.model.predictor.discriminator(x_.detatch(), ilens_, ys_gan) 
-            else:
-                real_label = 1.0 + self.gan_params['smooth'] * (random.random() - 1)
-                ys_gan = (real_label * ys_gan.new_ones((len(x[2]), 1))).to(self.device)
-                loss = (1. / self.ngpu) * self.model.predictor.discriminator(x[0], x[1], ys_gan) 
-             
-            self.get_optimizer('gan').zero_grad()  # Clear the parameter gradients
+       
+        # Augmenting Batch
+        if self._do_aug_batch():
+            self.done_augment += 1.0
+            batch = self.get_iterator('aug').next()
+            z = self.converter['aug'](batch, self.device)
+            self.get_optimizer('aug').zero_grad()
+            x_, ilens_ = self.generator(z[0], z[1])
+            x = (x_, ilens_, z[2])
+            is_aug = True
+
+            # GAN 
+            if self.gan_params['weight'] > 0.0 and x[0].shape[1] // 9 - 1 > self.gan_params['gan_wsize']:
+                ys_gan = (ys_gan.new_ones((len(x[2]), 1))).to(self.device)
+                loss_gan = (self.gan_params['weight'] / scale) * self.discriminator(x_, ilens_, ys_gan)  
+                self.discriminator.reporter.report({'loss_gen': float(loss_gan)})
+            
+        # Audio Batch
+        else: 
+            batch = self.get_iterator('main').next()
+            x = self.converter['main'](batch, self.device)
+            self.done_audio += 1.0
+            is_aug = False
+                  
+        # Compute the loss at this time step and accumulate it
+        if self.model is not None:
+            self.get_optimizer('main').zero_grad()  # Clear the parameter gradients
+            loss = 1. / scale * self.model(*x, aug=is_aug) + loss_gan
             if self.ngpu > 1:
                 loss.backward(loss.new_ones(self.ngpu))  # Backprop
             else:
                 loss.backward()  # Backprop
             loss.detach()  # Truncate the graph
+     
+            # Update model parameters and generator parameters 
+            grad_norm = torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.grad_clip_threshold)
+            logging.info('grad norm={}'.format(grad_norm))
+            if math.isnan(grad_norm):
+                logging.warning('grad norm is nan. Do not update model.')
+            else:
+                self.get_optimizer('main').step()
+            
+            # Check if Generator is used
+            if is_aug:
+                grad_norm = torch.nn.utils.clip_grad_norm_(self.generator.parameters(), self.grad_clip_threshold)
+                logging.info('grad norm={}'.format(grad_norm))
+                if math.isnan(grad_norm):
+                    logging.warning('grad norm is nan. Do not update model.')
+                else:
+                    self.get_optimizer('aug').step()
+        
+        # If Discriminator is used
+        if self.gan_params['weight'] > 0.0 and x[0].shape[1] // 9 - 1 > self.gan_params['gan_wsize']:
+            # Discriminator Labels
+            if is_aug:
+                self.done_gan += 1.0
+                print("GAN Accept Rate: ", self.done_gan / self.done_augment, self.done_gan, self.done_augment)
+                label = self.gan_params['smooth'] * random.random()
+            else:
+                self.done_disc += 1.0
+                print("Disc Accept Rate: ", self.done_disc / self.done_audio, self.done_disc, self.done_audio)
+                label = 1.0 + self.gan_params['smooth'] * (random.random() - 1)
+            ys_gan = (label * ys_gan.new_ones((len(x[2]), 1))).to(self.device)
+            self.get_optimizer('gan').zero_grad() 
+            loss_discrim = (self.gan_params['weight'] / scale) * self.discriminator(x[0].detach(), x[1], ys_gan) 
+            if self.ngpu > 1:
+                loss_discrim.backward(loss.new_ones(self.ngpu))  # Backprop
+            else:
+                loss_discrim.backward()  # Backprop
+            self.discriminator.reporter.report({'loss_discrim': float(loss_discrim)})
+            loss_discrim.detach()  # Truncate the graph
             grad_norm = torch.nn.utils.clip_grad_norm_(
-                self.model.predictor.discriminator.parameters(),
-                self.grad_clip_threshold)
+                self.discriminator.parameters(), self.grad_clip_threshold)
             logging.info('grad norm={}'.format(grad_norm))
             if math.isnan(grad_norm):
                 logging.warning('grad norm is nan. Do not update model.')
@@ -347,10 +381,6 @@ def train(args):
         mtl_mode = 'mtl'
         logging.info('Multitask learning mode')
 
-    # specify model architecture
-    e2e = E2E(idim, odim, args)
-    model = Loss(e2e, args.mtlalpha, args.gan_weight)
-
     # write model config
     if not os.path.exists(args.outdir):
         os.makedirs(args.outdir)
@@ -361,50 +391,66 @@ def train(args):
     for key in sorted(vars(args).keys()):
         logging.info('ARGS: ' + key + ': ' + str(vars(args)[key]))
 
-    reporter = model.reporter
-
-    # check the use of multi-gpu
-    if args.ngpu > 1:
-        model = torch.nn.DataParallel(model, device_ids=list(range(args.ngpu)))
-        logging.info('batch size is automatically increased (%d -> %d)' % (
-            args.batch_size, args.batch_size * args.ngpu))
-        args.batch_size *= args.ngpu
-
-    # set torch device
     device = torch.device("cuda" if args.ngpu > 0 else "cpu")
-    model = model.to(device)
+
+    # specify model architecture
+    if not args.gan_only:
+        e2e = E2E(idim, odim, args)
+        model = Loss(e2e, args.mtlalpha)
+     
+        # check the use of multi-gpu
+        if args.ngpu > 1:
+            model = torch.nn.DataParallel(model, device_ids=list(range(args.ngpu)))
+            logging.info('batch size is automatically increased (%d -> %d)' % (
+                args.batch_size, args.batch_size * args.ngpu))
+            args.batch_size *= args.ngpu
+
+        # set torch device
+        model = model.to(device)
+    
+    if args.aug_use:
+        gen = Generator(args.aug_vocab_size, args.aug_idim, idim, args)
+        disc = Discriminator(idim, args.gan_odim, window_size=args.gan_wsize)
+        gen = gen.to(device)
+        disc = disc.to(device)
 
     # Setup an optimizer
     optimizer = {}
     if args.opt == 'adadelta':
-        optimizer['main'] = torch.optim.Adadelta(
-            model.parameters(), rho=0.95, eps=args.eps)
+        if not args.gan_only: 
+            optimizer['main'] = torch.optim.Adadelta(
+                model.parameters(), rho=0.95, eps=args.eps)
         if args.aug_use:
-            optimizer['aug'] = torch.optim.Adadelta(model.predictor.generator.parameters(), rho=0.95, eps=args.eps)
+            optimizer['aug'] = torch.optim.Adadelta(gen.parameters(), rho=0.95, eps=args.eps)
     elif args.opt == 'adam':
-        optimizer['main'] = torch.optim.Adam(model.parameters())
+        if not args.gan_only:
+            optimizer['main'] = torch.optim.Adam(model.parameters())
         if args.aug_use:
-            optimizer['aug'] = torch.optim.Adam(model.predictor.generator.parameters())
+            optimizer['aug'] = torch.optim.Adam(gen.parameters())
 
     if args.gan_weight > 0.0 and args.aug_use:
-        optimizer['gan'] = torch.optim.SGD(model.predictor.discriminator.parameters(), lr=0.005, momentum=0.8)
-        reporter_discrim = model.predictor.discriminator.reporter
+        optimizer['gan'] = torch.optim.SGD(disc.parameters(), lr=0.0001, momentum=0.8)
     
     # FIXME: TOO DIRTY HACK
-    setattr(optimizer['main'], "target", reporter)
-    setattr(optimizer['main'], "serialize", lambda s: reporter.serialize(s))
+    if not args.gan_only:
+        setattr(optimizer['main'], "target", model.reporter)
+        setattr(optimizer['main'], "serialize", lambda s: model.reporter.serialize(s))
     
-    if args.aug_use:
-        setattr(optimizer['aug'], "target", reporter)
-        setattr(optimizer['aug'], "serialize", lambda s: reporter.serialize(s))
+    if args.aug_use and not args.gan_only:
+        setattr(optimizer['aug'], "target", model.aug_reporter)
+        setattr(optimizer['aug'], "serialize", lambda s: model.aug_reporter.serialize(s))
+    elif args.aug_use:
+        setattr(optimizer['aug'], "target", disc.reporter)
+        setattr(optimizer['aug'], "serialize", lambda s: disc.reporter.serialize(s))
 
     if args.gan_weight > 0.0 and args.aug_use:
-        setattr(optimizer['gan'], "target", reporter_discrim)
-        setattr(optimizer['gan'], "serialize", lambda s: reporter_discrim.serialize(s))
+        setattr(optimizer['gan'], "target", disc.reporter)
+        setattr(optimizer['gan'], "serialize", lambda s: disc.reporter.serialize(s))
 
     # Setup a converter
-    converter = CustomConverter(e2e.subsample[0])		
-    
+    #converter = CustomConverter(e2e.subsample[0])		
+    converter = CustomConverter()
+
     # read json data
     with open(args.train_json, 'rb') as f:
         train_json = json.load(f)['utts']
@@ -419,9 +465,14 @@ def train(args):
         train_augment, meta = make_augment_batchset(augment_json, args.batch_size,
                                                     args.maxlen_in, args.maxlen_out,
                                                     args.minibatches, args.subsample)        
+        
+        if args.etype != 'tdnn':
+            expand_iline = 4
+        else:
+            expand_iline = 3
         converter_augment = AugmentConverter(meta['idict'], meta['odict'],
                                              meta['ifilename'], meta['ofilename'],
-                                             expand_iline=4,
+                                             expand_iline=expand_iline,
                                              subsamping_factor=1) 
 
 
@@ -460,8 +511,10 @@ def train(args):
     # Set up a trainer
     if args.aug_use:
         aug_params = {'rat': args.aug_ratio, 'pretrain': args.aug_pretrain} 
-        gan_params = {'weight': args.gan_weight, 'smooth': args.gan_smooth}
-        updater = GANUpdater(model, args.grad_clip, train_iter,
+        gan_params = {'weight': args.gan_weight, 'smooth': args.gan_smooth, 'gan_wsize': args.gan_wsize}
+        if args.gan_only:
+            model = None
+        updater = GANUpdater(model, gen, disc, args.grad_clip, train_iter,
                  optimizer, {'main': converter, 'aug': converter_augment}, device, args.ngpu, aug_params, gan_params)   
     else:
         updater = CustomUpdater(
@@ -475,80 +528,90 @@ def train(args):
         torch_resume(args.resume, trainer)
 
     # Evaluate the model with the test dataset for each epoch
-    trainer.extend(CustomEvaluator(model, valid_iter, reporter, converter, device))
+    if not args.gan_only:
+        trainer.extend(CustomEvaluator(model, valid_iter, model.reporter, converter, device))
 
-    # Save attention weight each epoch
-    if args.num_save_attention > 0 and args.mtlalpha != 1.0:
-        data = sorted(list(valid_json.items())[:args.num_save_attention],
-                      key=lambda x: int(x[1]['input'][0]['shape'][1]), reverse=True)
-        if hasattr(model, "module"):
-            att_vis_fn = model.module.predictor.calculate_all_attentions
-        else:
-            att_vis_fn = model.predictor.calculate_all_attentions
-        trainer.extend(PlotAttentionReport(
-            att_vis_fn, data, args.outdir + "/att_ws",
-            converter=converter, device=device), trigger=(1, 'epoch'))
+        # Save attention weight each epoch
+        if args.num_save_attention > 0 and args.mtlalpha != 1.0:
+            data = sorted(list(valid_json.items())[:args.num_save_attention],
+                          key=lambda x: int(x[1]['input'][0]['shape'][1]), reverse=True)
+            if hasattr(model, "module"):
+                att_vis_fn = model.module.predictor.calculate_all_attentions
+            else:
+                att_vis_fn = model.predictor.calculate_all_attentions
+            trainer.extend(PlotAttentionReport(
+                att_vis_fn, data, args.outdir + "/att_ws",
+                converter=converter, device=device), trigger=(1, 'epoch'))
 
-    # Make a plot for training and validation values
-    trainer.extend(extensions.PlotReport(['main/loss', 'validation/main/loss',
-                                          'main/loss_ctc', 'validation/main/loss_ctc',
-                                          'main/loss_att', 'validation/main/loss_att'],
-                                         'epoch', file_name='loss.png'))
-    trainer.extend(extensions.PlotReport(['main/acc', 'validation/main/acc'],
-                                         'epoch', file_name='acc.png'))
+        # Make a plot for training and validation values
+        trainer.extend(extensions.PlotReport(['main/loss', 'validation/main/loss',
+                                              'main/loss_ctc', 'validation/main/loss_ctc',
+                                              'main/loss_att', 'validation/main/loss_att'],
+                                             'epoch', file_name='loss.png'))
+        trainer.extend(extensions.PlotReport(['main/acc', 'validation/main/acc'],
+                                             'epoch', file_name='acc.png'))
 
-    # Save best models
-    trainer.extend(extensions.snapshot_object(model, 'model.loss.best', savefun=torch_save),
-                   trigger=training.triggers.MinValueTrigger('validation/main/loss'))
+        # Save best models
+        trainer.extend(extensions.snapshot_object(model, 'model.loss.best', savefun=torch_save),
+                       trigger=training.triggers.MinValueTrigger('validation/main/loss'))
+        
+        trainer.extend(extensions.snapshot_object(model, 'model.loss.best_{.updater.epoch}', savefun=torch_save),
+                       trigger=training.triggers.MinValueTrigger('validation/main/loss'))
+
+        if mtl_mode is not 'ctc':
+            trainer.extend(extensions.snapshot_object(model, 'model.acc.best', savefun=torch_save),
+                       trigger=training.triggers.MaxValueTrigger('validation/main/acc'))
+
+            trainer.extend(extensions.snapshot_object(model, 'model.acc.best_{.updater.epoch}', savefun=torch_save),
+                       trigger=training.triggers.MaxValueTrigger('validation/main/acc'))
+
+   
+        # epsilon decay in the optimizer
+        if args.opt == 'adadelta':
+            if args.criterion == 'acc' and mtl_mode is not 'ctc':
+                trainer.extend(restore_snapshot(model, args.outdir + '/model.acc.best', load_fn=torch_load),
+                           trigger=CompareValueTrigger(
+                               'validation/main/acc',
+                               lambda best_value, current_value: best_value > current_value))
+                trainer.extend(adadelta_eps_decay(args.eps_decay),
+                           trigger=CompareValueTrigger(
+                               'validation/main/acc',
+                               lambda best_value, current_value: best_value > current_value))
+            elif args.criterion == 'loss':
+                trainer.extend(restore_snapshot(model, args.outdir + '/model.loss.best', load_fn=torch_load),
+                           trigger=CompareValueTrigger(
+                               'validation/main/loss',
+                               lambda best_value, current_value: best_value < current_value))
+                trainer.extend(adadelta_eps_decay(args.eps_decay),
+                           trigger=CompareValueTrigger(
+                               'validation/main/loss',
+                               lambda best_value, current_value: best_value < current_value))
+
     
-    trainer.extend(extensions.snapshot_object(model, 'model.loss.best_{.updater.epoch}', savefun=torch_save),
-                   trigger=training.triggers.MinValueTrigger('validation/main/loss'))
-
-    if mtl_mode is not 'ctc':
-        trainer.extend(extensions.snapshot_object(model, 'model.acc.best', savefun=torch_save),
-                       trigger=training.triggers.MaxValueTrigger('validation/main/acc'))
-
-        trainer.extend(extensions.snapshot_object(model, 'model.acc.best_{.updater.epoch}', savefun=torch_save),
-                       trigger=training.triggers.MaxValueTrigger('validation/main/acc'))
-
+    if args.aug_use:
+        trainer.extend(extensions.snapshot_object(gen, 'gen.loss.best_{.updater.epoch}', savefun=torch_save),
+                    trigger=(1, 'epoch'))
+   
     # save snapshot which contains model and optimizer states
-    trainer.extend(torch_snapshot(), trigger=(1, 'epoch'))
+    #trainer.extend(torch_snapshot(), trigger=(1, 'epoch'))
 
-    # epsilon decay in the optimizer
-    if args.opt == 'adadelta':
-        if args.criterion == 'acc' and mtl_mode is not 'ctc':
-            trainer.extend(restore_snapshot(model, args.outdir + '/model.acc.best', load_fn=torch_load),
-                           trigger=CompareValueTrigger(
-                               'validation/main/acc',
-                               lambda best_value, current_value: best_value > current_value))
-            trainer.extend(adadelta_eps_decay(args.eps_decay),
-                           trigger=CompareValueTrigger(
-                               'validation/main/acc',
-                               lambda best_value, current_value: best_value > current_value))
-        elif args.criterion == 'loss':
-            trainer.extend(restore_snapshot(model, args.outdir + '/model.loss.best', load_fn=torch_load),
-                           trigger=CompareValueTrigger(
-                               'validation/main/loss',
-                               lambda best_value, current_value: best_value < current_value))
-            trainer.extend(adadelta_eps_decay(args.eps_decay),
-                           trigger=CompareValueTrigger(
-                               'validation/main/loss',
-                               lambda best_value, current_value: best_value < current_value))
-
+    
     # Write a log of evaluation statistics for each epoch
     trainer.extend(extensions.LogReport(trigger=(REPORT_INTERVAL, 'iteration')))
-    report_keys = ['epoch', 'iteration', 'main/loss', 'main/loss_ctc', 'main/loss_att', 'main/loss_gan', 'gan/loss_discrim'
+    report_keys = ['epoch', 'iteration', 'main/loss', 'main/loss_ctc', 'main/loss_att',
+                   'aug/loss_ctc', 'aug/loss_att', 'aug/loss', 'aug/acc', 'gan/loss_discrim', 'gan/loss_gen',
                    'validation/main/loss', 'validation/main/loss_ctc', 'validation/main/loss_att',
                    'main/acc', 'validation/main/acc', 'elapsed_time']
-    if args.opt == 'adadelta':
-        trainer.extend(extensions.observe_value(
-            'eps', lambda trainer: trainer.updater.get_optimizer('main').param_groups[0]["eps"]),
-            trigger=(REPORT_INTERVAL, 'iteration'))
-        report_keys.append('eps')
+    if not args.gan_only:
+        if args.opt == 'adadelta':
+            trainer.extend(extensions.observe_value(
+                'eps', lambda trainer: trainer.updater.get_optimizer('main').param_groups[0]["eps"]),
+                trigger=(REPORT_INTERVAL, 'iteration'))
+            report_keys.append('eps')
     trainer.extend(extensions.PrintReport(
         report_keys), trigger=(REPORT_INTERVAL, 'iteration'))
 
-    trainer.extend(extensions.ProgressBar(update_interval=REPORT_INTERVAL))
+    trainer.extend(extensions.ProgressBar(update_interval=4*REPORT_INTERVAL))
 
     # Run the training
     trainer.run()
