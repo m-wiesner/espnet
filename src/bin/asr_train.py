@@ -104,6 +104,8 @@ def main():
                         help='Number of decoder hidden units')
     parser.add_argument('--mtlalpha', default=0.5, type=float,
                         help='Multitask learning coefficient, alpha: alpha*ctc_loss + (1-alpha)*att_loss ')
+    parser.add_argument('--mtlalpha-decay', default=1.0, type=float,
+                        help='Multitask learning coefficient decay rate, alpha *= decay')
     parser.add_argument('--lsm-type', const='', default='', type=str, nargs='?', choices=['', 'unigram'],
                         help='Apply label smoothing with a specified distribution type')
     parser.add_argument('--lsm-weight', default=0.0, type=float,
@@ -167,6 +169,10 @@ def main():
     parser.add_argument('--gan-wsize', default=20, type=int, help='Window size for GAN loss')
     parser.add_argument('--gan-odim', default=128, type=int, help='Dimension of discriminator outputs (prefinal layer)') 
     parser.add_argument('--gan-only', action='store_true', help='Train the GAN only')
+    parser.add_argument('--gtype', default='blstmp', type=str,
+                        choices=['tdnn', 'blstm', 'blstmp', 'vggblstmp', 'vggblstm'],
+                        help='Type of encoder network architecture')
+ 
     
     args = parser.parse_args()
 

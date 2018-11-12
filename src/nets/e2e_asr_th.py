@@ -162,7 +162,6 @@ class Loss(torch.nn.Module):
         batch_reporter.report(dict([loss_data, loss_att_data, loss_ctc_data, acc_data]))
         #else:
         #logging.warning('loss (=%f) is not correct', loss_data[1])
-
         return self.loss
 
 
@@ -349,7 +348,11 @@ class E2E(torch.nn.Module):
 
         # encoder
         self.enc = Encoder(args.etype, idim, args.elayers, args.eunits, args.eprojs,
-                           self.subsample, args.dropout_rate)
+                           self.subsample, args.dropout_rate,
+                           tdnn_offsets=args.tdnn_offsets,
+                           tdnn_odims=args.tdnn_odims,
+                           tdnn_prefinal_affine_dim=args.tdnn_prefinal_affine_dim,
+                           tdnn_final_affine_dim=args.tdnn_final_affine_dim)
         # ctc
         self.ctc = CTC(odim, args.eprojs, args.dropout_rate)
         # attention

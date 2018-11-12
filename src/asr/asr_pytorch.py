@@ -103,13 +103,14 @@ class CustomUpdater(training.StandardUpdater):
     '''Custom updater for pytorch'''
 
     def __init__(self, model, grad_clip_threshold, train_iter,
-                 optimizer, converter, device, ngpu):
+                 optimizer, converter, device, ngpu, mtlalpha_decay=1.0):
         super(CustomUpdater, self).__init__(train_iter, optimizer)
         self.model = model
         self.grad_clip_threshold = grad_clip_threshold
         self.converter = converter
         self.device = device
         self.ngpu = ngpu
+        self.decay = mtlalpha_decay
 
     # The core part of the update routine can be customized by overriding.
     def update_core(self):
@@ -139,7 +140,7 @@ class CustomUpdater(training.StandardUpdater):
             logging.warning('grad norm is nan. Do not update model.')
         else:
             optimizer.step()
-
+            self.model.mtlalpha *= self.decay
 
 # Controls GAN PSDA / MMDA
 class GANUpdater(training.StandardUpdater):
@@ -147,7 +148,7 @@ class GANUpdater(training.StandardUpdater):
         Updater for GAN PSDA / MMDA
     '''
     def __init__(self, model, generator, discriminator, grad_clip_threshold, train_iter,
-                 optimizer, converter, device, ngpu, aug_params, gan_params):
+                 optimizer, converter, device, ngpu, aug_params, gan_params, mtlalpha_decay=1.0):
         super(GANUpdater, self).__init__(train_iter, optimizer)
         
         # Class Attributes
@@ -158,6 +159,7 @@ class GANUpdater(training.StandardUpdater):
         self.converter = converter
         self.device = device
         self.ngpu = ngpu
+        self.decay = mtlalpha_decay
         self.sources = train_iter.keys()
 
         # Augment Attributes
@@ -217,7 +219,7 @@ class GANUpdater(training.StandardUpdater):
             else:
                 loss.backward()  # Backprop
             loss.detach()  # Truncate the graph
-     
+
             # Update model parameters and generator parameters 
             grad_norm = torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.grad_clip_threshold)
             logging.info('grad norm={}'.format(grad_norm))
@@ -225,7 +227,8 @@ class GANUpdater(training.StandardUpdater):
                 logging.warning('grad norm is nan. Do not update model.')
             else:
                 self.get_optimizer('main').step()
-            
+                self.model.mtlalpha *= self.decay
+ 
             # Check if Generator is used
             if is_aug:
                 grad_norm = torch.nn.utils.clip_grad_norm_(self.generator.parameters(), self.grad_clip_threshold)
@@ -247,7 +250,7 @@ class GANUpdater(training.StandardUpdater):
                 print("Disc Accept Rate: ", self.done_disc / self.done_audio, self.done_disc, self.done_audio)
                 label = 1.0 + self.gan_params['smooth'] * (random.random() - 1)
             ys_gan = (label * ys_gan.new_ones((len(x[2]), 1))).to(self.device)
-            self.get_optimizer('gan').zero_grad() 
+            self.get_optimizer('gan').zero_grad()
             loss_discrim = (self.gan_params['weight'] / scale) * self.discriminator(x[0].detach(), x[1], ys_gan) 
             if self.ngpu > 1:
                 loss_discrim.backward(loss.new_ones(self.ngpu))  # Backprop
@@ -429,7 +432,7 @@ def train(args):
             optimizer['aug'] = torch.optim.Adam(gen.parameters())
 
     if args.gan_weight > 0.0 and args.aug_use:
-        optimizer['gan'] = torch.optim.SGD(disc.parameters(), lr=0.0001, momentum=0.8)
+        optimizer['gan'] = torch.optim.SGD(disc.parameters(), lr=0.0008, momentum=0.5)
     
     # FIXME: TOO DIRTY HACK
     if not args.gan_only:
@@ -515,10 +518,10 @@ def train(args):
         if args.gan_only:
             model = None
         updater = GANUpdater(model, gen, disc, args.grad_clip, train_iter,
-                 optimizer, {'main': converter, 'aug': converter_augment}, device, args.ngpu, aug_params, gan_params)   
+                 optimizer, {'main': converter, 'aug': converter_augment}, device, args.ngpu, aug_params, gan_params, mtlalpha_decay=args.mtlalpha_decay)   
     else:
         updater = CustomUpdater(
-            model, args.grad_clip, train_iter, optimizer, converter, device, args.ngpu)
+            model, args.grad_clip, train_iter, optimizer, converter, device, args.ngpu, mtlalpha_decay=args.mtlalpha_decay)
     trainer = training.Trainer(
         updater, (args.epochs, 'epoch'), out=args.outdir)
 
