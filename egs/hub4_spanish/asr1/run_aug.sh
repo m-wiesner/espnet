@@ -253,7 +253,7 @@ if [ ${stage} -le 4 ]; then
       echo "---- GAN ONLY ----"
     fi
    
-    ${cuda_cmd} --gpu ${ngpu} ${expdir}/train.log \
+    #${cuda_cmd} --gpu ${ngpu} ${expdir}/train.log \
         asr_train.py \
         --ngpu ${ngpu} \
         --backend ${backend} \

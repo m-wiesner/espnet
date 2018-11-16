@@ -131,6 +131,7 @@ class CustomUpdater(training.StandardUpdater):
         else:
             loss = self.model(*x)
             loss.backward()  # Backprop
+        print(loss)
         loss.detach()  # Truncate the graph
         # compute the gradient norm to check if it is normal or not
         grad_norm = torch.nn.utils.clip_grad_norm_(
@@ -239,7 +240,7 @@ class GANUpdater(training.StandardUpdater):
                     self.get_optimizer('aug').step()
         
         # If Discriminator is used
-        if self.gan_params['weight'] > 0.0 and x[0].shape[1] // 9 - 1 > self.gan_params['gan_wsize']:
+        if self.gan_params['weight'] > 0.0 and x[0].shape[1] // 9 - 1 > self.gan_params['gan_wsize'] and (self.done_pretrain_aug >= self.aug_params['pretrain']):
             # Discriminator Labels
             if is_aug:
                 self.done_gan += 1.0
